@@ -1,0 +1,4 @@
+Frames generados: 38
+Compresión total: 80.0%
+Tamaño comprimido total: 480.6 KB
+Espacio usado en SPIFFS: 0.47 MB
