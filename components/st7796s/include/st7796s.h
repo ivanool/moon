@@ -107,6 +107,40 @@ void swap_and_display(void);
 void cleanup_double_buffers(void);
 void flush_immediate(const uint16_t* frame_buffer);
 
+/**
+ * @brief Special-case flush for camera frames: sends the framebuffer without
+ * performing the driver-wide byte-swap-for-DMA. Use this for camera-sourced
+ * buffers to preserve correct byte order.
+ */
+void flush_camera_frame(const uint16_t* frame_buffer);
+
+// --- SPIFFS preload API ----------------------------------------------------
+/**
+ * @brief Preload raw RGB565 frames from a directory in SPIFFS into PSRAM.
+ * @param base_dir Directory where frames are stored (e.g. "/spiffs").
+ *                 Frames are expected to be named "1.bin", "2.bin", ...
+ * @param max_preload Maximum number of frames to attempt to preload.
+ * @return Number of frames successfully preloaded (0 on failure).
+ */
+int preload_spiffs_frames(const char* base_dir, int max_preload);
+
+/**
+ * @brief Get pointer to a preloaded frame buffer (read-only pointer).
+ * @param index Frame index [0..count-1]
+ * @return Pointer to the raw RGB565 buffer or NULL if index invalid.
+ */
+const uint8_t* st7796s_get_preloaded_frame(int index);
+
+/**
+ * @brief Number of frames currently preloaded.
+ */
+int st7796s_get_preloaded_count(void);
+
+/**
+ * @brief Free any preloaded frames and release PSRAM.
+ */
+void st7796s_free_preloaded_frames(void);
+
 // Backwards-compatible double-buffering API requested by some examples
 void init_double_buffers(void);
 uint16_t* get_draw_buffer(void);

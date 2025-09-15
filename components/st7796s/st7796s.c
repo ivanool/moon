@@ -43,6 +43,11 @@ static uint8_t* dma_buffer = NULL;
 static size_t dma_buffer_size = 0;
 static bool window_set = false;
 
+// Preloaded frames store
+static uint8_t** preloaded_frames = NULL;
+static int preloaded_count = 0;
+static size_t preloaded_frame_bytes = 0;
+
 static void setup_spi(void);
 static void send_cmd(uint8_t cmd);
 static void send_data(const uint8_t* data, size_t size);
@@ -85,6 +90,62 @@ void mount_spiffs(void) {
     ret = esp_spiffs_info(NULL, &total, &used);
     if (ret != ESP_OK) ESP_LOGE(TAG, "Failed to get SPIFFS info (%s)", esp_err_to_name(ret));
     else ESP_LOGI(TAG, "SPIFFS Partition size: total: %d, used: %d", total, used);
+}
+
+int preload_spiffs_frames(const char* base_dir, int max_preload) {
+    if (!base_dir || max_preload <= 0) return 0;
+    // free previous if any
+    if (preloaded_frames) {
+        for (int i = 0; i < preloaded_count; ++i) if (preloaded_frames[i]) heap_caps_free(preloaded_frames[i]);
+        heap_caps_free(preloaded_frames);
+        preloaded_frames = NULL;
+        preloaded_count = 0;
+    }
+
+    size_t fb_bytes = (size_t)TFT_WIDTH * (size_t)TFT_HEIGHT * sizeof(uint16_t);
+    preloaded_frame_bytes = fb_bytes;
+
+    preloaded_frames = heap_caps_malloc(sizeof(uint8_t*) * max_preload, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!preloaded_frames) return 0;
+
+    for (int i = 0; i < max_preload; ++i) {
+        char path[128];
+        snprintf(path, sizeof(path), "%s/%d.bin", base_dir, i + 1);
+        FILE* f = fopen(path, "rb");
+        if (!f) {
+            break; // stop on first missing
+        }
+        uint8_t* buf = heap_caps_malloc(fb_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!buf) { fclose(f); break; }
+        size_t r = fread(buf, 1, fb_bytes, f);
+        fclose(f);
+        if (r != fb_bytes) { heap_caps_free(buf); break; }
+        preloaded_frames[preloaded_count++] = buf;
+        ESP_LOGI(TAG, "Preloaded frame %d (%s)", i+1, path);
+    }
+    if (preloaded_count == 0) {
+        heap_caps_free(preloaded_frames);
+        preloaded_frames = NULL;
+    }
+    return preloaded_count;
+}
+
+const uint8_t* st7796s_get_preloaded_frame(int index) {
+    if (index < 0 || index >= preloaded_count) return NULL;
+    return preloaded_frames[index];
+}
+
+int st7796s_get_preloaded_count(void) {
+    return preloaded_count;
+}
+
+void st7796s_free_preloaded_frames(void) {
+    if (!preloaded_frames) return;
+    for (int i = 0; i < preloaded_count; ++i) if (preloaded_frames[i]) heap_caps_free(preloaded_frames[i]);
+    heap_caps_free(preloaded_frames);
+    preloaded_frames = NULL;
+    preloaded_count = 0;
+    preloaded_frame_bytes = 0;
 }
 
 void load_font(uint8_t *font_data) {
@@ -464,6 +525,67 @@ static void enviar_datos_grandes_dma(const uint8_t* data, size_t size) {
     }
 }
 
+// Helper: always send without swapping bytes (copy as-is into DMA buffer)
+static void enviar_datos_grandes_dma_no_swap(const uint8_t* data, size_t size) {
+    if (size == 0 || !dma_buffer) return;
+    gpio_set_level(TFT_DC, DATA_MODE);
+    size_t remaining = size;
+    const uint8_t* ptr = data;
+    while (remaining > 0) {
+        size_t chunk_size = (remaining > dma_buffer_size) ? dma_buffer_size : remaining;
+        memcpy(dma_buffer, ptr, chunk_size);
+
+        spi_transaction_t t;
+        memset(&t, 0, sizeof(t));
+        t.length = chunk_size * 8; // bits
+        t.tx_buffer = dma_buffer;
+        t.rx_buffer = NULL;
+        t.rxlength = 0;
+
+        esp_err_t ret = spi_device_polling_transmit(spi_handle, &t);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Fallo al transmitir chunk DMA (no-swap) de %u bytes (polling): %s", (unsigned)chunk_size, esp_err_to_name(ret));
+            return;
+        }
+
+        ptr += chunk_size;
+        remaining -= chunk_size;
+    }
+}
+
+// Helper: always send with explicit byte-swap (swap each pair before sending)
+static void enviar_datos_grandes_dma_swap(const uint8_t* data, size_t size) {
+    if (size == 0 || !dma_buffer) return;
+    gpio_set_level(TFT_DC, DATA_MODE);
+    size_t remaining = size;
+    const uint8_t* ptr = data;
+    while (remaining > 0) {
+        size_t chunk_size = (remaining > dma_buffer_size) ? dma_buffer_size : remaining;
+
+        for (size_t i = 0; i + 1 < chunk_size; i += 2) {
+            dma_buffer[i] = ptr[i + 1];
+            dma_buffer[i + 1] = ptr[i];
+        }
+        if (chunk_size % 2) dma_buffer[chunk_size - 1] = ptr[chunk_size - 1];
+
+        spi_transaction_t t;
+        memset(&t, 0, sizeof(t));
+        t.length = chunk_size * 8; // bits
+        t.tx_buffer = dma_buffer;
+        t.rx_buffer = NULL;
+        t.rxlength = 0;
+
+        esp_err_t ret = spi_device_polling_transmit(spi_handle, &t);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Fallo al transmitir chunk DMA (swap) de %u bytes (polling): %s", (unsigned)chunk_size, esp_err_to_name(ret));
+            return;
+        }
+
+        ptr += chunk_size;
+        remaining -= chunk_size;
+    }
+}
+
 static void gpio_init(void) {
     gpio_config_t io_conf = {
         .pin_bit_mask = (1ULL << TFT_DC) | (1ULL << TFT_RST),
@@ -634,4 +756,30 @@ void flush_immediate(const uint16_t* frame_buffer) {
     // Direct flush without checking window_set state
     send_cmd(RAMWR);
     enviar_datos_grandes_dma((const uint8_t*)frame_buffer, (size_t)TFT_WIDTH * (size_t)TFT_HEIGHT * 2);
+}
+
+// Special-case flush for camera frames: do not perform any byte-swap and
+// send the raw buffer as-is. This avoids color-channel flipping for camera
+// sources that already produce the desired byte order.
+void flush_camera_frame(const uint16_t* frame_buffer) {
+    if (!frame_buffer) return;
+    // Ensure window is set
+    if (!window_set) {
+        set_window(0, 0, TFT_WIDTH - 1, TFT_HEIGHT - 1);
+        window_set = true;
+    } else {
+        send_cmd(RAMWR);
+    }
+
+    // Call the opposite path of the general-purpose DMA sender so camera
+    // frames get the inverse endianness treatment. If the generic path
+    // swaps bytes (TFT_SWAP_BYTES_FOR_DMA defined), we must send no-swap
+    // for camera frames. Otherwise, send the explicit swap path.
+#ifdef TFT_SWAP_BYTES_FOR_DMA
+    // Generic path swaps -> camera needs no-swap
+    enviar_datos_grandes_dma_no_swap((const uint8_t*)frame_buffer, (size_t)TFT_WIDTH * (size_t)TFT_HEIGHT * 2);
+#else
+    // Generic path does not swap -> camera needs swapped bytes
+    enviar_datos_grandes_dma_swap((const uint8_t*)frame_buffer, (size_t)TFT_WIDTH * (size_t)TFT_HEIGHT * 2);
+#endif
 }
